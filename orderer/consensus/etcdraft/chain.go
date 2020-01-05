@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/pem"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,7 @@ type Configurator interface {
 type RPC interface {
 	SendConsensus(dest uint64, msg *orderer.ConsensusRequest) error
 	SendSubmit(dest uint64, request *orderer.SubmitRequest) error
+	SendCanpSubmit(dest uint64, request []*orderer.SubmitRequest) error
 }
 
 //go:generate counterfeiter -o mocks/mock_blockpuller.go . BlockPuller
@@ -131,6 +133,11 @@ type submit struct {
 	leader chan uint64
 }
 
+type peerSubmit struct {
+	submit submit
+	peerID uint64
+}
+
 type gc struct {
 	index uint64
 	state raftpb.ConfState
@@ -147,6 +154,17 @@ type Chain struct {
 	channelID string
 
 	lastKnownLeader uint64
+
+	// for canopus
+	localSubmits   []*orderer.SubmitRequest
+	localChan      chan *submit
+	randomInt      uint64
+	iteration      int
+	peerSubmits    chan *peerSubmit
+	consensusCycle map[uint64][]*orderer.SubmitRequest
+	repID          uint64
+	startCycle     bool
+	submitLimit    int
 
 	submitC  chan *submit
 	applyC   chan apply
@@ -204,6 +222,10 @@ func NewChain(
 	f CreateBlockPuller,
 	haltCallback func(),
 	observeC chan<- raft.SoftState) (*Chain, error) {
+
+	//for canopus
+	randInt := uint64(5577006791947779411)
+	iteration := 1
 
 	lg := opts.Logger.With("channel", support.ChainID(), "node", opts.RaftID)
 
@@ -275,7 +297,17 @@ func NewChain(
 		},
 		logger: lg,
 		opts:   opts,
+		//for canopus
+		randomInt:      randInt,
+		iteration:      iteration,
+		consensusCycle: make(map[uint64][]*orderer.SubmitRequest),
+		peerSubmits:    make(chan *peerSubmit),
+		localChan:      make(chan *submit),
+		startCycle:     false,
+		submitLimit:    3,
 	}
+
+	c.repID = DetermineRepID(c.raftID)
 
 	// Sets initial values for metrics
 	c.Metrics.ClusterSize.Set(float64(len(c.opts.BlockMetadata.ConsenterIds)))
@@ -318,8 +350,7 @@ func NewChain(
 
 // Start instructs the orderer to begin serving the chain and keep it current.
 func (c *Chain) Start() {
-	c.logger.Infof("Starting Raft node")
-
+	c.logger.Infof("Starting Raft node. Iteration : ", c.iteration, ". Random number : ", c.randomInt)
 	if err := c.configureComm(); err != nil {
 		c.logger.Errorf("Failed to start chain, aborting: +%v", err)
 		close(c.doneC)
@@ -357,19 +388,22 @@ func (c *Chain) Start() {
 
 // Order submits normal type transactions for ordering.
 func (c *Chain) Order(env *common.Envelope, configSeq uint64) error {
+	fmt.Println("When receive a invoke function from peer, this function is called. ConfigSeq : ", configSeq)
 	c.Metrics.NormalProposalsReceived.Add(1)
-	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
+	go c.CanpSubmit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0, false)
+	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0, false)
 }
 
 // Configure submits config type transactions for ordering.
 func (c *Chain) Configure(env *common.Envelope, configSeq uint64) error {
+	fmt.Println("Configuration update transactions appear here : ", configSeq)
 	c.Metrics.ConfigProposalsReceived.Add(1)
 	if err := c.checkConfigUpdateValidity(env); err != nil {
 		c.logger.Warnf("Rejected config: %s", err)
 		c.Metrics.ProposalFailures.Add(1)
 		return err
 	}
-	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
+	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0, false)
 }
 
 // Validate the config update for being of Type A or Type B as described in the design doc.
@@ -532,13 +566,19 @@ func (c *Chain) Consensus(req *orderer.ConsensusRequest, sender uint64) error {
 // - the local serveRequest goroutine if this is leader
 // - the actual leader via the transport mechanism
 // The call fails if there's no leader elected yet.
-func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
+func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64, isDispatched bool) error {
+	fmt.Println("starting Submission >>>>>>>>>>>>>>>>")
 	if err := c.isRunning(); err != nil {
 		c.Metrics.ProposalFailures.Add(1)
 		return err
 	}
-
 	leadC := make(chan uint64, 1)
+	if isDispatched == true {
+		c.peerSubmits <- &peerSubmit{
+			submit: submit{req, leadC},
+			peerID: c.randomInt + sender,
+		}
+	}
 	select {
 	case c.submitC <- &submit{req, leadC}:
 		lead := <-leadC
@@ -548,9 +588,13 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 		}
 
 		if lead != c.raftID {
-			if err := c.rpc.SendSubmit(lead, req); err != nil {
-				c.Metrics.ProposalFailures.Add(1)
-				return err
+			// if channelID is mychannel, do not submit here.
+			// need one sendsubmit for channel creation
+			if c.channelID == "byfn-sys-channel" || c.raftID == 1 {
+				if err := c.rpc.SendSubmit(lead, req); err != nil {
+					c.Metrics.ProposalFailures.Add(1)
+					return err
+				}
 			}
 		}
 
@@ -559,6 +603,13 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 		return errors.Errorf("chain is stopped")
 	}
 
+	return nil
+}
+
+// CanpSubmit canopus
+func (c *Chain) CanpSubmit(req *orderer.SubmitRequest, sender uint64, isDispatched bool) error {
+	leadC := make(chan uint64, c.repID)
+	c.localChan <- &submit{req, leadC}
 	return nil
 }
 
@@ -661,9 +712,14 @@ func (c *Chain) serveRequest() {
 		c.Metrics.IsLeader.Set(0)
 	}
 
+	// canopus
+	localC := c.localChan
+	peerC := c.peerSubmits
+
 	for {
 		select {
 		case s := <-submitC:
+
 			if s == nil {
 				// polled by `WaitReady`
 				continue
@@ -680,13 +736,16 @@ func (c *Chain) serveRequest() {
 			}
 
 			batches, pending, err := c.ordered(s.req)
+			fmt.Println("Ordering batches")
 			if err != nil {
 				c.logger.Errorf("Failed to order message: %s", err)
 				continue
 			}
 			if pending {
+				fmt.Println("Start timer if not started")
 				startTimer() // no-op if timer is already started
 			} else {
+				fmt.Println("Stop timer")
 				stopTimer()
 			}
 
@@ -702,7 +761,9 @@ func (c *Chain) serveRequest() {
 			}
 
 		case app := <-c.applyC:
+			fmt.Println("Raft related or is it ?")
 			if app.soft != nil {
+				fmt.Println("Im here !!!>>><<<")
 				newLeader := atomic.LoadUint64(&app.soft.Lead) // etcdraft requires atomic access
 				if newLeader != soft.Lead {
 					c.logger.Infof("Raft leader changed: %d -> %d", soft.Lead, newLeader)
@@ -783,6 +844,7 @@ func (c *Chain) serveRequest() {
 			}
 
 		case <-timer.C():
+			fmt.Println("Timeout")
 			ticking = false
 
 			batch := c.support.BlockCutter().Cut()
@@ -793,6 +855,7 @@ func (c *Chain) serveRequest() {
 
 			c.logger.Debugf("Batch timer expired, creating block")
 			c.propose(propC, bc, batch) // we are certain this is normal block, no need to block
+			// c.StartCanpConsensus()
 
 		case sn := <-c.snapC:
 			if sn.Metadata.Index != 0 {
@@ -824,6 +887,87 @@ func (c *Chain) serveRequest() {
 			c.logger.Infof("Stop serving requests")
 			c.periodicChecker.Stop()
 			return
+
+		case s := <-localC:
+			c.localSubmits = append(c.localSubmits, s.req)
+			fmt.Printf("^^^^^^ Length of localsubmits : %d\n", len(c.localSubmits))
+			if len(c.localSubmits) >= c.submitLimit {
+				c.StartCanpConsensus()
+			}
+
+		case s := <-peerC:
+			c.consensusCycle[c.randomInt+s.peerID] = append(c.consensusCycle[c.randomInt+s.peerID], s.submit.req)
+			fmt.Println("********* Length of consensusCycle[", s.peerID, "] : ", len(c.consensusCycle[c.randomInt+s.peerID]), len(c.consensusCycle[c.randomInt+c.raftID]))
+			if len(c.consensusCycle[c.randomInt+s.peerID]) >= c.submitLimit {
+				c.DetermineEndOfCycle()
+			}
+		}
+	}
+}
+
+// StartCanpConsensus canopus
+// dispatch payload to other leaves
+// add to consensuscycle with rand number
+func (c *Chain) StartCanpConsensus() error {
+	fmt.Println("StartCanpConsensus")
+	if len(c.localSubmits) < c.submitLimit {
+		fmt.Println("Buffer not saturated")
+		return nil
+	}
+	c.startCycle = true
+	c.consensusCycle[c.randomInt+c.raftID] = c.localSubmits
+	c.localSubmits = nil
+	var err error = nil
+	// dispatch to other orderers
+	dispatchNodes := LeafNodesFromID(c.raftID, c.iteration)
+	for _, node := range dispatchNodes {
+		if node != c.raftID {
+			fmt.Println(">><<>><<>><<>> node submit : ", node)
+			c.rpc.SendCanpSubmit(node, c.consensusCycle[c.randomInt+c.raftID])
+		}
+	}
+	// dispatch to super leaf in other branch
+	c.DetermineEndOfCycle()
+	return err
+}
+
+// DetermineEndOfCycle canopus
+func (c *Chain) DetermineEndOfCycle() {
+	fmt.Println("DetermineEndOfCycle : 5577006791947779416", len(c.consensusCycle[5577006791947779416]))
+	// msgs := c.consensusCycle
+	if c.startCycle == false {
+		fmt.Println("here 1")
+		c.StartCanpConsensus()
+		return
+	}
+	fmt.Println("here 2")
+	superLeafNodes := LeafNodesFromID(c.raftID, c.iteration)
+	if c.iteration == 1 {
+		fmt.Println("here 3")
+		if len(superLeafNodes) == len(c.consensusCycle) {
+			fmt.Println("here 4")
+			for _, node := range superLeafNodes {
+				fmt.Println("<<>> ", node, " : ", c.randomInt+node, " : ", len(c.consensusCycle[c.randomInt+node]))
+				if len(c.consensusCycle[c.randomInt+node]) < c.submitLimit {
+					fmt.Println("here 5")
+					return
+				}
+			}
+			c.iteration++
+			fmt.Println("here 6")
+			var sortedMsgs []*orderer.SubmitRequest
+			keys := make([]uint64, 0, len(c.consensusCycle))
+			for k := range c.consensusCycle {
+				keys = append(keys, k)
+			}
+			sort.SliceStable(keys, func(i int, j int) bool { return keys[i] < keys[j] })
+			for _, k := range keys {
+				items := c.consensusCycle[k]
+				for _, item := range items {
+					sortedMsgs = append(sortedMsgs, item)
+				}
+			}
+			fmt.Println("Length of sorted messages : ", len(sortedMsgs))
 		}
 	}
 }
@@ -902,9 +1046,12 @@ func (c *Chain) ordered(msg *orderer.SubmitRequest) (batches [][]*common.Envelop
 }
 
 func (c *Chain) propose(ch chan<- *common.Block, bc *blockCreator, batches ...[]*common.Envelope) {
+	fmt.Println("Starting propose : ", len(batches))
 	for _, batch := range batches {
+		fmt.Println("propose -> Creating block")
 		b := bc.createNextBlock(batch)
 		c.logger.Infof("Created block [%d], there are %d blocks in flight", b.Header.Number, c.blockInflight)
+		fmt.Println("propose -> Block created")
 
 		select {
 		case ch <- b:
@@ -919,7 +1066,7 @@ func (c *Chain) propose(ch chan<- *common.Block, bc *blockCreator, batches ...[]
 
 		c.blockInflight++
 	}
-
+	fmt.Println("Finish propose")
 	return
 }
 
@@ -1008,6 +1155,7 @@ func (c *Chain) detectConfChange(block *common.Block) *MembershipChanges {
 }
 
 func (c *Chain) apply(ents []raftpb.Entry) {
+	fmt.Println("Start writing blocks")
 	if len(ents) == 0 {
 		return
 	}
@@ -1020,6 +1168,7 @@ func (c *Chain) apply(ents []raftpb.Entry) {
 	for i := range ents {
 		switch ents[i].Type {
 		case raftpb.EntryNormal:
+			fmt.Println("Normal entry")
 			if len(ents[i].Data) == 0 {
 				break
 			}
@@ -1039,6 +1188,7 @@ func (c *Chain) apply(ents []raftpb.Entry) {
 			c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
 
 		case raftpb.EntryConfChange:
+			fmt.Println("Configuration entry")
 			var cc raftpb.ConfChange
 			if err := cc.Unmarshal(ents[i].Data); err != nil {
 				c.logger.Warnf("Failed to unmarshal ConfChange data: %s", err)

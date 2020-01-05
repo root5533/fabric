@@ -8,6 +8,7 @@ package etcdraft
 
 import (
 	"bytes"
+	"fmt"
 	"path"
 	"reflect"
 	"time"
@@ -90,6 +91,7 @@ func (c *Consenter) TargetChannel(message proto.Message) string {
 // ReceiverByChain returns the MessageReceiver for the given channelID or nil
 // if not found.
 func (c *Consenter) ReceiverByChain(channelID string) MessageReceiver {
+	// c.Logger.Infof("Start receiverbychain -> consentor.go")
 	cs := c.Chains.GetChain(channelID)
 	if cs == nil {
 		return nil
@@ -130,10 +132,12 @@ func (c *Consenter) detectSelfID(consenters map[uint64]*etcdraft.Consenter) (uin
 
 // HandleChain returns a new Chain instance or an error upon failure
 func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *common.Metadata) (consensus.Chain, error) {
+	c.Logger.Infof("Start handlechain -> consentor.go")
 	m := &etcdraft.ConfigMetadata{}
 	if err := proto.Unmarshal(support.SharedConfig().ConsensusMetadata(), m); err != nil {
 		return nil, errors.Wrap(err, "failed to unmarshal consensus metadata")
 	}
+	// fmt.Printf("consentor.go -> Handlechain -> m.consentors -> %+v\n", m.Consenters)
 
 	if m.Options == nil {
 		return nil, errors.New("etcdraft options have not been provided")
@@ -151,6 +155,7 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 	// information from the recently committed block meta data
 	// field.
 	blockMetadata, err := ReadBlockMetadata(metadata, m)
+	// fmt.Printf("consentor.go -> HandleChain -> blockmetadata -> %+v\n", blockMetadata)
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to read Raft metadata")
 	}
@@ -167,6 +172,7 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 		})
 		return &inactive.Chain{Err: errors.Errorf("channel %s is not serviced by me", support.ChainID())}, nil
 	}
+	fmt.Printf("consentor.go -> Handlechain -> id -> %+v\n", id)
 
 	var evictionSuspicion time.Duration
 	if c.EtcdRaftConfig.EvictionSuspicion == "" {
@@ -208,6 +214,7 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 		Cert:              c.Cert,
 		Metrics:           c.Metrics,
 	}
+	// fmt.Printf("consentor.go -> Handlechain -> opts -> %+v\n", opts)
 
 	rpc := &cluster.RPC{
 		Timeout:       c.OrdererConfig.General.Cluster.RPCTimeout,
@@ -216,6 +223,8 @@ func (c *Consenter) HandleChain(support consensus.ConsenterSupport, metadata *co
 		Comm:          c.Communication,
 		StreamsByType: cluster.NewStreamsByType(),
 	}
+	// fmt.Printf("consentor.go -> Handlechain -> rpc -> %+v\n", rpc)
+
 	return NewChain(
 		support,
 		opts,

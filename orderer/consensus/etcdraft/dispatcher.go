@@ -7,6 +7,8 @@ SPDX-License-Identifier: Apache-2.0
 package etcdraft
 
 import (
+	"fmt"
+
 	"github.com/hyperledger/fabric/common/flogging"
 	"github.com/hyperledger/fabric/protos/orderer"
 	"github.com/pkg/errors"
@@ -20,7 +22,7 @@ type MessageReceiver interface {
 	Consensus(req *orderer.ConsensusRequest, sender uint64) error
 
 	// Submit passes the given SubmitRequest message to the MessageReceiver
-	Submit(req *orderer.SubmitRequest, sender uint64) error
+	Submit(req *orderer.SubmitRequest, sender uint64, isDispatched bool) error
 }
 
 //go:generate mockery -dir . -name ReceiverGetter -case underscore -output mocks
@@ -49,10 +51,11 @@ func (d *Dispatcher) OnConsensus(channel string, sender uint64, request *orderer
 
 // OnSubmit notifies the Dispatcher for a reception of a SubmitRequest from a given sender on a given channel
 func (d *Dispatcher) OnSubmit(channel string, sender uint64, request *orderer.SubmitRequest) error {
+	fmt.Println("Dispatcher onsubmit : ", channel, " : ", sender)
 	receiver := d.ChainSelector.ReceiverByChain(channel)
 	if receiver == nil {
 		d.Logger.Warningf("An attempt to submit a transaction to a non existing channel (%s) was made by %d", channel, sender)
 		return errors.Errorf("channel %s doesn't exist", channel)
 	}
-	return receiver.Submit(request, sender)
+	return receiver.Submit(request, sender, true)
 }

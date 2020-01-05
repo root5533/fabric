@@ -9,6 +9,7 @@ package etcdraft
 import (
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +48,7 @@ type node struct {
 }
 
 func (n *node) start(fresh, join bool) {
+	fmt.Printf("node.go -> start -> n.metadata.ConsenterIds -> %+v\n", n.metadata.ConsenterIds)
 	raftPeers := RaftPeers(n.metadata.ConsenterIds)
 	n.logger.Debugf("Starting raft node: #peers: %v", len(raftPeers))
 
@@ -135,6 +137,7 @@ func (n *node) run(campaign bool) {
 
 			// skip empty apply
 			if len(rd.CommittedEntries) != 0 || rd.SoftState != nil {
+				fmt.Println("Add entry to chain.applyc")
 				n.chain.applyC <- apply{rd.CommittedEntries, rd.SoftState}
 			}
 
