@@ -193,6 +193,12 @@ type Chain struct {
 	periodicChecker *PeriodicCheck
 
 	haltCallback func()
+
+	// for Canopus
+	lock        *WriteLock
+	currentNode int
+	ordererC    *[]chan *orderer.SubmitRequest
+	maxMsgCount int
 }
 
 // NewChain constructs a chain object.
@@ -205,6 +211,7 @@ func NewChain(
 	haltCallback func(),
 	observeC chan<- raft.SoftState) (*Chain, error) {
 
+	fmt.Println(">>>>>>>>>> Creating Chain")
 	lg := opts.Logger.With("channel", support.ChainID(), "node", opts.RaftID)
 
 	fresh := !wal.Exist(opts.WALDir)
@@ -313,6 +320,19 @@ func NewChain(
 		metadata:     c.opts.BlockMetadata,
 	}
 
+	// for Canopus
+	lock := WriteLock{writing: false}
+	sizeOfNetwork := 6
+	chans := make([]chan *orderer.SubmitRequest, sizeOfNetwork)
+	for i := 0; i < sizeOfNetwork; i++ {
+		chans[i] = make(chan *orderer.SubmitRequest, 100)
+	}
+	msgCount := 5
+	c.lock = &lock
+	c.ordererC = &chans
+	c.currentNode = 2
+	c.maxMsgCount = msgCount
+
 	return c, nil
 }
 
@@ -357,7 +377,9 @@ func (c *Chain) Start() {
 
 // Order submits normal type transactions for ordering.
 func (c *Chain) Order(env *common.Envelope, configSeq uint64) error {
+	fmt.Println(">>>>>>>>> Receiving msg from client")
 	c.Metrics.NormalProposalsReceived.Add(1)
+	go c.CanpSubmit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
 	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
 }
 
@@ -533,6 +555,11 @@ func (c *Chain) Consensus(req *orderer.ConsensusRequest, sender uint64) error {
 // - the actual leader via the transport mechanism
 // The call fails if there's no leader elected yet.
 func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
+	fmt.Println("<<<<<<<<<<< Transaction submission : ", sender)
+
+	// TODO send msg to other peers
+	// TODO add msg to channel
+	// TODO check whether limit is reached to start block writing. Use locks here
 	if err := c.isRunning(); err != nil {
 		c.Metrics.ProposalFailures.Add(1)
 		return err
@@ -547,7 +574,7 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 			return errors.Errorf("no Raft leader")
 		}
 
-		if lead != c.raftID {
+		if lead != c.raftID && c.raftID == 1 {
 			if err := c.rpc.SendSubmit(lead, req); err != nil {
 				c.Metrics.ProposalFailures.Add(1)
 				return err
@@ -559,6 +586,59 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 		return errors.Errorf("chain is stopped")
 	}
 
+	return nil
+}
+
+func (c *Chain) CanpSubmit(req *orderer.SubmitRequest, sender uint64) error {
+	fmt.Println("Canopus submission")
+	if sender == 0 {
+		sender = c.raftID
+
+		// TODO send msg to other nodes
+	}
+	(*c.ordererC)[sender] <- req
+	if sender == uint64(c.currentNode) && len((*c.ordererC)[sender]) >= c.maxMsgCount && c.lock.getWriteVal() == false {
+		fmt.Println("Start creating block")
+		c.lock.setWriteVal(true)
+		err := c.CreateBlock()
+		if err != nil {
+			fmt.Println("Error happened")
+			return err
+		}
+		// c.currentNode++
+		// c.lock.setWriteVal(false)
+	}
+
+	return nil
+}
+
+func (c *Chain) CreateBlock() error {
+	var batches [][]*common.Envelope
+	var pending bool
+	var err error
+
+	for i := 0; i < c.maxMsgCount; i++ {
+		msg := <-(*c.ordererC)[c.currentNode]
+		batches, pending, err = c.ordered(msg)
+
+		if err != nil {
+			return err
+		}
+
+		if pending {
+			continue
+		} else {
+			fmt.Println("Batch : ", pending, " : ", len(batches))
+			break
+		}
+	}
+	for _, batch := range batches {
+		block := c.support.CreateNextBlock(batch)
+		fmt.Printf("Block type %T\n", block)
+		c.support.WriteBlock(block, nil)
+		c.logger.Infof("Writing block [%d] (Raft index: %d) to ledger", block.Header.Number)
+		c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
+	}
 	return nil
 }
 
