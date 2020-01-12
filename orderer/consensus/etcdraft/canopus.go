@@ -19,6 +19,10 @@ func (lock *WriteLock) setWriteVal(val bool) {
 	lock.mux.Unlock()
 }
 
-func CanopusNodes() []int {
-	return []int{1, 2, 3, 4, 5}
+func CanopusNodes() []uint64 {
+	var nodes []uint64
+	for i := 1; i < 6; i++ {
+		nodes = append(nodes, uint64(i))
+	}
+	return nodes
 }
