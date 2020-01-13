@@ -195,10 +195,12 @@ type Chain struct {
 	haltCallback func()
 
 	// for Canopus
-	lock        *WriteLock
-	currentNode int
-	ordererC    *[]chan *orderer.SubmitRequest
-	maxMsgCount int
+	lock           *WriteLock
+	currentNode    int
+	ordererC       *[]chan *orderer.SubmitRequest
+	maxMsgCount    int
+	receivedFrom   chan uint64
+	pendingBatches chan [][]*common.Envelope
 }
 
 // NewChain constructs a chain object.
@@ -326,11 +328,13 @@ func NewChain(
 	for i := 0; i < sizeOfNetwork; i++ {
 		chans[i] = make(chan *orderer.SubmitRequest, 100)
 	}
-	msgCount := 1
+	msgCount := 5
 	c.lock = &lock
 	c.ordererC = &chans
 	c.currentNode = 1
 	c.maxMsgCount = msgCount
+	c.receivedFrom = make(chan uint64)
+	c.pendingBatches = make(chan [][]*common.Envelope)
 
 	return c, nil
 }
@@ -376,7 +380,6 @@ func (c *Chain) Start() {
 
 // Order submits normal type transactions for ordering.
 func (c *Chain) Order(env *common.Envelope, configSeq uint64) error {
-	fmt.Println(">>>>>>>>> Receiving msg from client")
 	c.Metrics.NormalProposalsReceived.Add(1)
 	go c.CanpSubmit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
 	return c.Submit(&orderer.SubmitRequest{LastValidationSeq: configSeq, Payload: env, Channel: c.channelID}, 0)
@@ -554,13 +557,11 @@ func (c *Chain) Consensus(req *orderer.ConsensusRequest, sender uint64) error {
 // - the actual leader via the transport mechanism
 // The call fails if there's no leader elected yet.
 func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
-	fmt.Println("<<<<<<<<<<< Transaction submission : ", sender)
-	if c.isConfig(req.Payload) == false {
+	// fmt.Println("<<<<<<<<<<< Transaction submission : ", sender)
+	if c.isConfig(req.Payload) == false && sender != 0 {
 		go c.CanpSubmit(req, sender)
 	}
-	// TODO send msg to other peers
-	// TODO add msg to channel
-	// TODO check whether limit is reached to start block writing. Use locks here
+
 	if err := c.isRunning(); err != nil {
 		c.Metrics.ProposalFailures.Add(1)
 		return err
@@ -590,79 +591,51 @@ func (c *Chain) Submit(req *orderer.SubmitRequest, sender uint64) error {
 	return nil
 }
 
-func (c *Chain) CanpSubmit(req *orderer.SubmitRequest, sender uint64) error {
-	fmt.Println("Canopus submission")
+func (c *Chain) CanpSubmit(req *orderer.SubmitRequest, sender uint64) {
+	// fmt.Println("Canopus submission")
 	if sender == 0 {
 		sender = c.raftID
-		// TODO send msg to other nodes
 		go c.DistributeMessages(sender, req)
 	}
 	(*c.ordererC)[sender] <- req
-	c.logger.Info("Lock value : ", c.lock.getWriteVal())
-	if sender == uint64(c.currentNode) && len((*c.ordererC)[sender]) >= c.maxMsgCount && c.lock.getWriteVal() == false {
-		fmt.Println("Start creating block")
-		c.lock.setWriteVal(true)
-		err := c.CanpCreateBlock()
-		if err != nil {
-			return err
-		}
-		// c.currentNode++
-		c.lock.setWriteVal(false)
-	}
-
-	if sender == uint64(c.currentNode) && len((*c.ordererC)[sender]) >= c.maxMsgCount {
-		for {
-			if c.lock.getWriteVal() == false {
-				fmt.Println("Start creating block")
-				c.lock.setWriteVal(true)
-				err := c.CanpCreateBlock()
-				if err != nil {
-					return err
-				}
-				// c.currentNode++
-				c.lock.setWriteVal(false)
-				break
-			}
-		}
-	}
-
-	return nil
+	c.receivedFrom <- sender
 }
 
-func (c *Chain) CanpCreateBlock() error {
-	var batches [][]*common.Envelope
-	var pending bool
-	var err error
+func (c *Chain) CanpCreateBatch(node int) (batches [][]*common.Envelope, pending bool, err error) {
 
 	for i := 0; i < c.maxMsgCount; i++ {
-		msg := <-(*c.ordererC)[c.currentNode]
-		batches, pending, err = c.ordered(msg)
+		if (len((*c.ordererC)[node])) > 0 {
+			msg := <-(*c.ordererC)[node]
+			batches, pending, err = c.ordered(msg)
 
-		if err != nil {
-			return err
-		}
-
-		if pending {
-			continue
+			if err != nil {
+				return nil, false, err
+			}
+			if pending {
+				continue
+			} else {
+				// fmt.Println("Batch : ", pending, " : ", len(batches))
+				break
+			}
 		} else {
-			fmt.Println("Batch : ", pending, " : ", len(batches))
 			break
 		}
 	}
-	for _, batch := range batches {
-		block := c.support.CreateNextBlock(batch)
-		fmt.Printf("Block type %T\n", block)
-		c.support.WriteBlock(block, nil)
-		c.logger.Infof("Writing block [%d] to ledger", block.Header.Number)
-		c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
-	}
-	return nil
+	// for _, batch := range batches {
+	// 	block := c.support.CreateNextBlock(batch)
+	// 	c.support.WriteBlock(block, nil)
+	// 	c.logger.Infof("Writing block [%d] to ledger without cut", block.Header.Number)
+	// 	c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
+	// }
+	c.logger.Error("Batch creation : ", len(batches), " : ", pending)
+	return batches, pending, err
 }
 
 func (c *Chain) DistributeMessages(sender uint64, req *orderer.SubmitRequest) error {
 	leafNodes := CanopusNodes()
 	for _, nodeID := range leafNodes {
 		if nodeID != sender {
+			c.logger.Notice("sending to : ", nodeID, " from ", sender)
 			if err := c.rpc.SendSubmit(nodeID, req); err != nil {
 				c.Metrics.ProposalFailures.Add(1)
 				return err
@@ -704,6 +677,27 @@ func (c *Chain) serveRequest() {
 			<-timer.C()
 		}
 		ticking = false
+	}
+
+	// for canopus
+	canpTicking := false
+	canpTimer := c.clock.NewTimer(time.Second)
+	if !canpTimer.Stop() {
+		<-canpTimer.C()
+	}
+
+	startCanpTimer := func() {
+		if !canpTicking {
+			canpTicking = true
+			canpTimer.Reset(c.support.SharedConfig().BatchTimeout())
+		}
+	}
+
+	stopCanpTimer := func() {
+		if !canpTimer.Stop() && canpTicking {
+			<-canpTimer.C()
+		}
+		canpTicking = false
 	}
 
 	var soft raft.SoftState
@@ -938,8 +932,100 @@ func (c *Chain) serveRequest() {
 			c.logger.Infof("Stop serving requests")
 			c.periodicChecker.Stop()
 			return
+
+		// for canopus
+		case n := <-c.receivedFrom:
+			// if n == uint64(c.currentNode) && len((*c.ordererC)[n]) >= c.maxMsgCount {
+			// 	canpTicking = false
+			// 	for {
+			// 		if c.lock.getWriteVal() == false {
+			// 			fmt.Println("Start creating block")
+			// 			c.lock.setWriteVal(true)
+			// 			err := c.CanpCreateBlock(c.currentNode)
+			// 			if err != nil {
+			// 				c.logger.Error("Failed to create block")
+			// 				return
+			// 			}
+			// 			c.currentNode = nextNode(c.currentNode)
+			// 			c.logger.Infof("Changed current node order : %d\n", c.currentNode)
+			// 			c.lock.setWriteVal(false)
+			// 			break
+			// 		}
+			// 	}
+			// } else {
+			// 	startCanpTimer()
+			// }
+			if n == uint64(c.currentNode) {
+				batches, pending, err := c.CanpCreateBatch(c.currentNode)
+				if err != nil {
+					c.logger.Errorf("Failed to order message: %s", err)
+					continue
+				}
+				if pending {
+					c.logger.Warnf("Timer started >>>>><<<<<<<<<")
+					startCanpTimer()
+				} else {
+					c.logger.Warn("Timer >>>>><<<<<<<<< stoped. Batch : ", len(batches))
+					if len(batches) != 0 {
+						stopCanpTimer()
+						c.currentNode = nextNode(c.currentNode)
+						c.logger.Info("Came to create full batch")
+						for _, batch := range batches {
+							block := c.support.CreateNextBlock(batch)
+							c.support.WriteBlock(block, nil)
+							c.logger.Infof("Writing block [%d] to ledger without cut", block.Header.Number)
+							c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
+						}
+						go c.scanNextBuffer()
+					}
+				}
+			}
+
+		case <-canpTimer.C():
+			// fmt.Println("Timer expired")
+			// canpTicking = false
+			// if c.lock.getWriteVal() == false {
+			// 	err := c.CanpCreateBlock(1)
+			// 	if err != nil {
+			// 		c.logger.Error("Failed to create block")
+			// 		return
+			// 	}
+			// 	batch := c.support.BlockCutter().Cut()
+			// block := c.support.CreateNextBlock(batch)
+			// c.support.WriteBlock(block, nil)
+			// c.logger.Infof("Writing block [%d] to ledger with cut", block.Header.Number)
+			// c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
+			// }
+			c.logger.Warnf(">>>>><<<<<<<<< timer expired")
+			canpTicking = false
+			// _, _, err := c.CanpCreateBatch(1)
+			// if err != nil {
+			// 	c.logger.Errorf("Failed to order message: %s", err)
+			// 	continue
+			// }
+			batch := c.support.BlockCutter().Cut()
+			block := c.support.CreateNextBlock(batch)
+			c.support.WriteBlock(block, nil)
+			c.logger.Infof("Writing block [%d] to ledger with cut", block.Header.Number)
+			c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
+			// c.currentNode = 1
+
+			// case batches := <-c.pendingBatches:
+			// c.logger.Info("Came to create full batch")
+			// for _, batch := range batches {
+			// 	block := c.support.CreateNextBlock(batch)
+			// 	c.support.WriteBlock(block, nil)
+			// 	c.logger.Infof("Writing block [%d] to ledger without cut", block.Header.Number)
+			// 	c.Metrics.CommittedBlockNumber.Set(float64(block.Header.Number))
+			// }
+			// c.receivedFrom <- uint64(c.currentNode)
 		}
 	}
+}
+
+// for canopus
+func (c *Chain) scanNextBuffer() {
+	c.receivedFrom <- uint64(c.currentNode)
 }
 
 func (c *Chain) writeBlock(block *common.Block, index uint64) {

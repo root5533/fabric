@@ -26,3 +26,12 @@ func CanopusNodes() []uint64 {
 	}
 	return nodes
 }
+
+func nextNode(current int) int {
+	totalNodes := 5
+	num := (current + 1) % totalNodes
+	if num == 0 {
+		num = 5
+	}
+	return num
+}
